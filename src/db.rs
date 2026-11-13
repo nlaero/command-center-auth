@@ -19,6 +19,8 @@ pub enum DbError {
     Sqlite(#[from] rusqlite::Error),
     #[error("password hash: {0}")]
     Password(String),
+    #[error("username_taken")]
+    UsernameTaken,
     #[error("lock poisoned")]
     Lock,
 }
@@ -95,11 +97,19 @@ impl Db {
         let password_hash = hash_password(password)?;
         let now = Utc::now().timestamp();
         let conn = self.lock()?;
-        conn.execute(
+        match conn.execute(
             "INSERT INTO users (id, username, username_norm, password_hash, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, display, norm, password_hash, now],
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(info, _))
+                if info.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(DbError::UsernameTaken);
+            }
+            Err(e) => return Err(DbError::Sqlite(e)),
+        }
         Ok(UserRow {
             id,
             username: display.to_string(),

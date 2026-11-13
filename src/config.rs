@@ -36,7 +36,8 @@ impl Config {
                 .unwrap_or_else(|_| "command-center-auth".into()),
             jwt_aud: env::var("AUTH_JWT_AUD")
                 .unwrap_or_else(|_| "command-center-desktop".into()),
-            allow_register: parse_bool("AUTH_ALLOW_REGISTER", false),
+            // Self-register from Command Center is the product path; false is an emergency lock.
+            allow_register: parse_bool("AUTH_ALLOW_REGISTER", true),
             login_rate_limit: parse_u32("AUTH_LOGIN_RATE_LIMIT", 20)?,
             login_rate_window_secs: parse_u64("AUTH_LOGIN_RATE_WINDOW_SECS", 300)?,
         })

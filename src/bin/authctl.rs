@@ -69,9 +69,12 @@ fn config_or_exit() -> Config {
 
 fn usage() {
     eprintln!(
-        "authctl — Command Center auth-server admin\n\n\
+        "authctl — Command Center auth-server host tooling\n\n\
+         Primary signup is POST /auth/register from Command Center.\n\
+         create-user is optional recovery when AUTH_ALLOW_REGISTER=false\n\
+         or the DB needs a repair account.\n\n\
          Commands:\n\
-           create-user <username>   Create a user (Argon2id)\n\
+           create-user <username>   Host recovery: create a user (Argon2id)\n\
            rotate-keys              Print JWT secret rotation instructions\n\
            help                     Show this help\n\n\
          Uses AUTH_DB / AUTH_JWT_SECRET from the environment or .env"
