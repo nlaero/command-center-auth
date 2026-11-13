@@ -1,0 +1,28 @@
+[Unit]
+Description=Command Center auth-server
+Documentation=https://github.com/nlaero/command-center-auth
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=auth-server
+Group=auth-server
+WorkingDirectory=/var/lib/auth-server
+EnvironmentFile=-/etc/auth-server.env
+ExecStart=/usr/local/bin/auth-server
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/auth-server
+
+# Defaults (override in /etc/auth-server.env):
+# AUTH_BIND=127.0.0.1:8080
+# AUTH_DB=/var/lib/auth-server/auth-server.db
+# AUTH_JWT_SECRET=...
+
+[Install]
+WantedBy=multi-user.target

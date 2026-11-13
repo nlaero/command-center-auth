@@ -1,0 +1,7 @@
+# Example TLS front for auth-server on a LAN host.
+# Replace auth-server.local with your hostname; install the mkcert/step CA on desktops.
+
+auth-server.local:8443 {
+	tls internal
+	reverse_proxy 127.0.0.1:8080
+}
