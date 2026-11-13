@@ -73,6 +73,7 @@ pub struct ErrorBody {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/auth/register", post(register))
         .route("/auth/login", post(login))
         .route("/auth/refresh", post(refresh))
         .route("/auth/logout", post(logout))
@@ -87,6 +88,54 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
+async fn register(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LoginRequest>,
+) -> impl IntoResponse {
+    if !state.cfg.allow_register {
+        return err(StatusCode::FORBIDDEN, "registration_disabled");
+    }
+
+    let username = body.username.trim();
+    if username.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "bad_request");
+    }
+    if body.password.len() < 8 {
+        return err(StatusCode::BAD_REQUEST, "weak_password");
+    }
+
+    let ip = client_ip(&headers);
+    let key = format!(
+        "reg:{}:{}",
+        ip,
+        crate::db::normalize_username(username)
+    );
+    let window = Duration::from_secs(state.cfg.login_rate_window_secs);
+    if !state
+        .limiter
+        .check_and_record(&key, state.cfg.login_rate_limit, window)
+    {
+        return err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
+
+    let user = match state.db.create_user(username, &body.password) {
+        Ok(u) => u,
+        Err(crate::db::DbError::UsernameTaken) => {
+            return err(StatusCode::CONFLICT, "username_taken");
+        }
+        Err(crate::db::DbError::Password(msg)) if msg.contains("at least 8") => {
+            return err(StatusCode::BAD_REQUEST, "weak_password");
+        }
+        Err(crate::db::DbError::Password(_)) => {
+            return err(StatusCode::BAD_REQUEST, "bad_request");
+        }
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    };
+
+    issue_pair(&state, &user.id, &user.username, None)
+}
+
 async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -94,7 +143,7 @@ async fn login(
 ) -> impl IntoResponse {
     let ip = client_ip(&headers);
     let key = format!(
-        "{}:{}",
+        "login:{}:{}",
         ip,
         crate::db::normalize_username(&body.username)
     );

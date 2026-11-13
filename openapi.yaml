@@ -3,7 +3,7 @@ info:
   title: Command Center auth-server
   version: 0.1.0
   description: |
-    Username/password login and token issuance for Command Center desktop.
+    Username/password self-register, login, and token issuance for Command Center desktop.
     Does not store Broadcastify or other source API credentials.
 servers:
   - url: https://auth-server.local:8443
@@ -20,6 +20,31 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+  /auth/register:
+    post:
+      summary: Self-register (primary signup from Command Center)
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Created user + token pair
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "429":
+          $ref: "#/components/responses/Error"
   /auth/login:
     post:
       summary: Login with username and password
@@ -163,5 +188,8 @@ components:
             - invalid_credentials
             - invalid_token
             - rate_limited
+            - username_taken
+            - weak_password
+            - registration_disabled
             - bad_request
             - internal
