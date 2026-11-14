@@ -34,6 +34,20 @@ pub struct UserRow {
 }
 
 #[derive(Clone, Debug)]
+pub struct SettingsRow {
+    pub revision: i64,
+    pub document: String,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub enum SettingsWrite {
+    Saved(SettingsRow),
+    Conflict(SettingsRow),
+    Missing,
+}
+
+#[derive(Clone, Debug)]
 pub struct RefreshRow {
     pub id: String,
     pub user_id: String,
@@ -76,6 +90,12 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id);
             CREATE INDEX IF NOT EXISTS idx_refresh_family ON refresh_tokens(family_id);
+            CREATE TABLE IF NOT EXISTS user_settings (
+              user_id TEXT PRIMARY KEY NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              revision INTEGER NOT NULL,
+              document TEXT NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
             ",
         )?;
         Ok(Self {
@@ -278,6 +298,79 @@ impl Db {
         )?;
         Ok(())
     }
+
+    pub fn get_settings(&self, user_id: &str) -> Result<Option<SettingsRow>, DbError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT revision, document, updated_at FROM user_settings WHERE user_id = ?1",
+            params![user_id],
+            settings_row,
+        )
+        .optional()
+        .map_err(DbError::from)
+    }
+
+    /// Create when `expected` is `None` and this user has no document.
+    /// Update when `expected` matches the stored revision. Otherwise report the current row.
+    pub fn put_settings(
+        &self,
+        user_id: &str,
+        expected: Option<i64>,
+        document: &str,
+    ) -> Result<SettingsWrite, DbError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let existing = tx
+            .query_row(
+                "SELECT revision, document, updated_at FROM user_settings WHERE user_id = ?1",
+                params![user_id],
+                settings_row,
+            )
+            .optional()?;
+        let now = Utc::now().timestamp();
+        let outcome = match existing {
+            None if expected.is_none() => {
+                tx.execute(
+                    "INSERT INTO user_settings (user_id, revision, document, updated_at)
+                     VALUES (?1, 1, ?2, ?3)",
+                    params![user_id, document, now],
+                )?;
+                SettingsWrite::Saved(SettingsRow {
+                    revision: 1,
+                    document: document.to_string(),
+                    updated_at: now,
+                })
+            }
+            Some(row) if expected == Some(row.revision) => {
+                let revision = row.revision + 1;
+                tx.execute(
+                    "UPDATE user_settings
+                     SET revision = ?1, document = ?2, updated_at = ?3
+                     WHERE user_id = ?4",
+                    params![revision, document, now, user_id],
+                )?;
+                SettingsWrite::Saved(SettingsRow {
+                    revision,
+                    document: document.to_string(),
+                    updated_at: now,
+                })
+            }
+            Some(row) => SettingsWrite::Conflict(row),
+            None => SettingsWrite::Missing,
+        };
+        if matches!(outcome, SettingsWrite::Saved(_)) {
+            tx.commit()?;
+        }
+        Ok(outcome)
+    }
+}
+
+fn settings_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SettingsRow> {
+    Ok(SettingsRow {
+        revision: row.get(0)?,
+        document: row.get(1)?,
+        updated_at: row.get(2)?,
+    })
 }
 
 pub fn normalize_username(username: &str) -> String {
@@ -307,4 +400,61 @@ fn hash_token(raw: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(raw.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> (Db, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "auth-settings-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let db = Db::open(&path).unwrap();
+        (db, path)
+    }
+
+    #[test]
+    fn settings_create_conflict_and_update() {
+        let (db, path) = temp_db();
+        let user = db.create_user("ada", "correct-password").unwrap();
+        assert!(db.get_settings(&user.id).unwrap().is_none());
+
+        let missing = db.put_settings(&user.id, Some(1), r#"{"title":"x"}"#).unwrap();
+        assert!(matches!(missing, SettingsWrite::Missing));
+
+        let created = db
+            .put_settings(&user.id, None, r#"{"title":"Ops"}"#)
+            .unwrap();
+        let SettingsWrite::Saved(row) = created else {
+            panic!("expected create");
+        };
+        assert_eq!(row.revision, 1);
+
+        let stale = db
+            .put_settings(&user.id, None, r#"{"title":"Other"}"#)
+            .unwrap();
+        let SettingsWrite::Conflict(current) = stale else {
+            panic!("expected conflict");
+        };
+        assert_eq!(current.revision, 1);
+        assert!(current.document.contains("Ops"));
+
+        let updated = db
+            .put_settings(&user.id, Some(1), r#"{"title":"Local"}"#)
+            .unwrap();
+        let SettingsWrite::Saved(row) = updated else {
+            panic!("expected update");
+        };
+        assert_eq!(row.revision, 2);
+        let stored = db.get_settings(&user.id).unwrap().unwrap();
+        assert_eq!(stored.revision, 2);
+        assert!(stored.document.contains("Local"));
+
+        let err = db.put_settings("missing-user", None, "{}").unwrap_err();
+        assert!(matches!(err, DbError::Sqlite(_)));
+        let _ = fs::remove_file(path);
+    }
 }

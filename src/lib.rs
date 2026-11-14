@@ -13,6 +13,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,6 +79,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/refresh", post(refresh))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
+        .route("/settings", get(read_settings).put(write_settings))
         .with_state(state)
 }
 
@@ -256,6 +258,147 @@ fn issue_pair(
         .into_response()
 }
 
+const MAX_SETTINGS_BYTES: usize = 512 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PutSettingsBody {
+    revision: Option<i64>,
+    document: Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsResponse {
+    revision: i64,
+    updated_at: i64,
+    document: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn read_settings(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let Some(user_id) = authed_user_id(&state, &headers) else {
+        return err(StatusCode::UNAUTHORIZED, "invalid_token");
+    };
+    match state.db.get_settings(&user_id) {
+        Ok(Some(row)) => settings_response(StatusCode::OK, &row, None),
+        Ok(None) => err(StatusCode::NOT_FOUND, "not_found"),
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
+}
+
+async fn write_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PutSettingsBody>,
+) -> impl IntoResponse {
+    let Some(user_id) = authed_user_id(&state, &headers) else {
+        return err(StatusCode::UNAUTHORIZED, "invalid_token");
+    };
+    if body.revision.is_some_and(|revision| revision < 0) || !body.document.is_object() {
+        return err(StatusCode::BAD_REQUEST, "bad_request");
+    }
+    if document_has_secret(&body.document) {
+        return err(StatusCode::BAD_REQUEST, "bad_request");
+    }
+    let Ok(raw) = serde_json::to_string(&body.document) else {
+        return err(StatusCode::BAD_REQUEST, "bad_request");
+    };
+    if raw.len() > MAX_SETTINGS_BYTES {
+        return err(StatusCode::BAD_REQUEST, "bad_request");
+    }
+    match state.db.put_settings(&user_id, body.revision, &raw) {
+        Ok(crate::db::SettingsWrite::Saved(row)) => settings_response(StatusCode::OK, &row, None),
+        Ok(crate::db::SettingsWrite::Conflict(row)) => {
+            settings_response(StatusCode::CONFLICT, &row, Some("conflict"))
+        }
+        Ok(crate::db::SettingsWrite::Missing) => err(StatusCode::NOT_FOUND, "not_found"),
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
+}
+
+fn authed_user_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    let token = bearer_token(headers)?;
+    let claims = verify_access(&state.cfg, &token).ok()?;
+    match state.db.find_user_by_id(&claims.sub) {
+        Ok(Some(user)) => Some(user.id),
+        _ => None,
+    }
+}
+
+fn settings_response(
+    status: StatusCode,
+    row: &crate::db::SettingsRow,
+    error: Option<&str>,
+) -> axum::response::Response {
+    let document = serde_json::from_str(&row.document).unwrap_or(Value::Null);
+    (
+        status,
+        Json(SettingsResponse {
+            revision: row.revision,
+            updated_at: row.updated_at,
+            document,
+            error: error.map(str::to_string),
+        }),
+    )
+        .into_response()
+}
+
+/// Reject password, token, and API-key fields. The `secrets` array is a list of
+/// key names and is allowed.
+fn document_has_secret(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(key, child)| {
+            if key == "secrets" {
+                return false;
+            }
+            if is_secret_field(key) {
+                return !is_empty_secret_value(child);
+            }
+            document_has_secret(child)
+        }),
+        Value::Array(items) => items.iter().any(document_has_secret),
+        _ => false,
+    }
+}
+
+fn is_empty_secret_value(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) if text.is_empty() => true,
+        _ => false,
+    }
+}
+
+fn is_secret_field(key: &str) -> bool {
+    const SECRET_KEYS: &[&str] = &[
+        "password",
+        "secret",
+        "token",
+        "apikey",
+        "api_key",
+        "apptoken",
+        "app_token",
+        "refreshtoken",
+        "refresh_token",
+        "accesstoken",
+        "access_token",
+        "authorization",
+        "clientsecret",
+        "client_secret",
+    ];
+    let normalized: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .flat_map(|ch| ch.to_lowercase())
+        .collect();
+    let flat = normalized.replace('_', "");
+    SECRET_KEYS
+        .iter()
+        .any(|item| *item == normalized.as_str() || item.replace('_', "") == flat)
+}
+
 fn err(status: StatusCode, code: &str) -> axum::response::Response {
     (status, Json(ErrorBody { error: code.into() })).into_response()
 }
@@ -264,6 +407,32 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let rest = value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer "))?;
     Some(rest.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_keep_secret_names_and_reject_values() {
+        let ok = serde_json::json!({
+            "sources": {
+                "feed": {
+                    "secrets": ["broadcastify.password"],
+                    "params": { "feedId": "42", "note": "desk" }
+                }
+            }
+        });
+        assert!(!document_has_secret(&ok));
+        let leaked = serde_json::json!({
+            "boards": [{ "options": { "password": "panel-secret-value" } }]
+        });
+        assert!(document_has_secret(&leaked));
+        let nested = serde_json::json!({
+            "sources": { "feed": { "params": { "nested": { "apiKey": "abcd1234efgh" } } } }
+        });
+        assert!(document_has_secret(&nested));
+    }
 }
 
 fn client_ip(headers: &HeaderMap) -> String {
