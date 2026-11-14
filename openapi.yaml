@@ -210,6 +210,59 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SettingsConflict"
+  /ai/memory:
+    get:
+      summary: Caption fixes for the signed-in user
+      description: |
+        Text corrections for the on-device model. Audio and model weights stay on the computer.
+        The same route works for a server on this computer and a remote server.
+      operationId: getAiMemory
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Stored caption fixes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiMemoryDocument"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+    put:
+      summary: Replace caption fixes for the signed-in user
+      description: |
+        `revision` is the last revision this client saved, or null to create.
+        A mismatch returns 409 with the current document. The document is caption text only.
+      operationId: putAiMemory
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PutAiMemoryRequest"
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiMemoryDocument"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          description: Revision conflict; body is the current document
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiMemoryConflict"
 components:
   securitySchemes:
     bearerAuth:
@@ -333,6 +386,63 @@ components:
     SettingsConflict:
       allOf:
         - $ref: "#/components/schemas/SettingsDocument"
+        - type: object
+          required: [error]
+          properties:
+            error:
+              type: string
+              enum: [conflict]
+    AiMemoryDocument:
+      type: object
+      required: [revision, updatedAt, document]
+      properties:
+        revision:
+          type: integer
+        updatedAt:
+          type: integer
+          description: Unix seconds
+        document:
+          $ref: "#/components/schemas/AiMemory"
+    PutAiMemoryRequest:
+      type: object
+      required: [document]
+      properties:
+        revision:
+          type: integer
+          nullable: true
+        document:
+          $ref: "#/components/schemas/AiMemory"
+    AiMemory:
+      type: object
+      required: [version, corrections]
+      additionalProperties: false
+      properties:
+        version:
+          type: integer
+          enum: [1]
+        corrections:
+          type: array
+          maxItems: 400
+          items:
+            type: object
+            required: [id, heard, says]
+            additionalProperties: false
+            properties:
+              id:
+                type: string
+                maxLength: 64
+              heard:
+                type: string
+                maxLength: 160
+              says:
+                type: string
+                maxLength: 160
+              count:
+                type: integer
+                minimum: 1
+    AiMemoryConflict:
+      allOf:
+        - $ref: "#/components/schemas/AiMemoryDocument"
         - type: object
           required: [error]
           properties:

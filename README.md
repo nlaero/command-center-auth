@@ -13,7 +13,9 @@ Two ways to run it:
 
 `GET` / `PUT /settings` is the board and source setup. Secret *names* are fine in that document. Secret *values* are rejected there even when the vault is on.
 
-Every install can export and import a backup (`authctl backup` or `auth-server --backup-export` / `--backup-import`). The file holds board accounts (password hashes, not the password), the server admin (also a hash), refresh sessions, boards, and any secrets the vault was storing. Stop the server before import. The JWT signing secret stays in the env file and is not part of the backup.
+`GET` / `PUT /ai/memory` is caption text for the on-device model. The same account document is stored whether this server is the one on the computer or a remote one. Audio and the model stay on the computer. A backup includes those caption fixes. An older backup that does not mention them restores without them.
+
+Every install can export and import a backup (`authctl backup` or `auth-server --backup-export` / `--backup-import`). The file holds board accounts (password hashes, not the password), the server admin (also a hash), refresh sessions, boards, caption fixes, and any secrets the vault was storing. Stop the server before import. The JWT signing secret stays in the env file and is not part of the backup.
 
 Setup asks for a server admin. That account opens the server settings page at `http://127.0.0.1:<port>/admin`. It is not a Command Center board login, and a board account cannot open that page. The page can add and remove board accounts, turn self-registration on or off, and turn secret storage on or off when this server is device-only. It can also switch between a Windows service and starting at login.
 
@@ -38,6 +40,8 @@ The Windows uninstaller removes the program, the service, the login startup entr
 | `GET` | `/auth/me` | Bearer access → `{ id, username }` |
 | `GET` | `/settings` | Bearer access → board document, or 404 |
 | `PUT` | `/settings` | Bearer access. `{ revision, document }` → saved, or 409 with the current document |
+| `GET` | `/ai/memory` | Bearer access → caption fixes, or 404 |
+| `PUT` | `/ai/memory` | Bearer access. `{ revision, document }` → saved, or 409. Text only |
 | `GET` | `/admin` | Server settings page. Loopback only. Server admin, not a board login |
 | `POST` | `/admin/api/login` | Server admin username and password. Token audience is `command-center-server-admin` |
 
@@ -94,6 +98,6 @@ Lab JWTs are HS256 with `AUTH_JWT_SECRET`. Move to Ed25519/RS256 before anything
 
 ## Status
 
-Working: register, login, refresh, logout, me; per-user board document at `/settings`; device-only secret vault; backup export/import; Argon2id; SQLite; refresh rotation + reuse revoke; basic rate limit.
+Working: register, login, refresh, logout, me; per-user board document at `/settings`; caption fixes at `/ai/memory`; device-only secret vault; backup export/import; Argon2id; SQLite; refresh rotation + reuse revoke; basic rate limit.
 
 Not yet: asymmetric JWT, TTY-hidden `authctl` passwords, production-grade rate limits. Desktop register UI ships with the Command Center auth client.

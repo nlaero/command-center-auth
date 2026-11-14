@@ -65,6 +65,21 @@ pub enum SettingsWrite {
     Missing,
 }
 
+#[derive(Clone, Copy)]
+enum UserDoc {
+    Settings,
+    AiMemory,
+}
+
+impl UserDoc {
+    fn table(self) -> &'static str {
+        match self {
+            UserDoc::Settings => "user_settings",
+            UserDoc::AiMemory => "user_ai_memory",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RefreshRow {
     pub id: String,
@@ -109,6 +124,12 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id);
             CREATE INDEX IF NOT EXISTS idx_refresh_family ON refresh_tokens(family_id);
             CREATE TABLE IF NOT EXISTS user_settings (
+              user_id TEXT PRIMARY KEY NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              revision INTEGER NOT NULL,
+              document TEXT NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS user_ai_memory (
               user_id TEXT PRIMARY KEY NOT NULL REFERENCES users(id) ON DELETE CASCADE,
               revision INTEGER NOT NULL,
               document TEXT NOT NULL,
@@ -277,9 +298,8 @@ impl Db {
 
     pub fn list_users(&self) -> Result<Vec<ListedUser>, DbError> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, username, created_at FROM users ORDER BY username_norm",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, username, created_at FROM users ORDER BY username_norm")?;
         let rows = stmt.query_map([], |row| {
             Ok(ListedUser {
                 id: row.get(0)?,
@@ -464,14 +484,11 @@ impl Db {
     }
 
     pub fn get_settings(&self, user_id: &str) -> Result<Option<SettingsRow>, DbError> {
-        let conn = self.lock()?;
-        conn.query_row(
-            "SELECT revision, document, updated_at FROM user_settings WHERE user_id = ?1",
-            params![user_id],
-            settings_row,
-        )
-        .optional()
-        .map_err(DbError::from)
+        self.get_user_doc(UserDoc::Settings, user_id)
+    }
+
+    pub fn get_ai_memory(&self, user_id: &str) -> Result<Option<SettingsRow>, DbError> {
+        self.get_user_doc(UserDoc::AiMemory, user_id)
     }
 
     /// Create when `expected` is `None` and this user has no document.
@@ -482,23 +499,53 @@ impl Db {
         expected: Option<i64>,
         document: &str,
     ) -> Result<SettingsWrite, DbError> {
+        self.put_user_doc(UserDoc::Settings, user_id, expected, document)
+    }
+
+    pub fn put_ai_memory(
+        &self,
+        user_id: &str,
+        expected: Option<i64>,
+        document: &str,
+    ) -> Result<SettingsWrite, DbError> {
+        self.put_user_doc(UserDoc::AiMemory, user_id, expected, document)
+    }
+
+    fn get_user_doc(&self, kind: UserDoc, user_id: &str) -> Result<Option<SettingsRow>, DbError> {
+        let conn = self.lock()?;
+        let sql = format!(
+            "SELECT revision, document, updated_at FROM {} WHERE user_id = ?1",
+            kind.table()
+        );
+        conn.query_row(&sql, params![user_id], settings_row)
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    fn put_user_doc(
+        &self,
+        kind: UserDoc,
+        user_id: &str,
+        expected: Option<i64>,
+        document: &str,
+    ) -> Result<SettingsWrite, DbError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
+        let select = format!(
+            "SELECT revision, document, updated_at FROM {} WHERE user_id = ?1",
+            kind.table()
+        );
         let existing = tx
-            .query_row(
-                "SELECT revision, document, updated_at FROM user_settings WHERE user_id = ?1",
-                params![user_id],
-                settings_row,
-            )
+            .query_row(&select, params![user_id], settings_row)
             .optional()?;
         let now = Utc::now().timestamp();
         let outcome = match existing {
             None if expected.is_none() => {
-                tx.execute(
-                    "INSERT INTO user_settings (user_id, revision, document, updated_at)
-                     VALUES (?1, 1, ?2, ?3)",
-                    params![user_id, document, now],
-                )?;
+                let insert = format!(
+                    "INSERT INTO {} (user_id, revision, document, updated_at) VALUES (?1, 1, ?2, ?3)",
+                    kind.table()
+                );
+                tx.execute(&insert, params![user_id, document, now])?;
                 SettingsWrite::Saved(SettingsRow {
                     revision: 1,
                     document: document.to_string(),
@@ -507,12 +554,11 @@ impl Db {
             }
             Some(row) if expected == Some(row.revision) => {
                 let revision = row.revision + 1;
-                tx.execute(
-                    "UPDATE user_settings
-                     SET revision = ?1, document = ?2, updated_at = ?3
-                     WHERE user_id = ?4",
-                    params![revision, document, now, user_id],
-                )?;
+                let update = format!(
+                    "UPDATE {} SET revision = ?1, document = ?2, updated_at = ?3 WHERE user_id = ?4",
+                    kind.table()
+                );
+                tx.execute(&update, params![revision, document, now, user_id])?;
                 SettingsWrite::Saved(SettingsRow {
                     revision,
                     document: document.to_string(),
@@ -530,9 +576,8 @@ impl Db {
 
     pub fn list_secrets(&self, user_id: &str) -> Result<BTreeMap<String, String>, DbError> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT name, value FROM user_secrets WHERE user_id = ?1 ORDER BY name",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT name, value FROM user_secrets WHERE user_id = ?1 ORDER BY name")?;
         let rows = stmt.query_map(params![user_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -632,6 +677,20 @@ impl Db {
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        let ai_memory = {
+            let mut stmt = conn.prepare(
+                "SELECT user_id, revision, document, updated_at FROM user_ai_memory ORDER BY user_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(SnapshotSettings {
+                    user_id: row.get(0)?,
+                    revision: row.get(1)?,
+                    document: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
         let admins = {
             let mut stmt = conn.prepare(
                 "SELECT id, username, username_norm, password_hash, created_at
@@ -653,6 +712,7 @@ impl Db {
             refresh_tokens,
             settings,
             secrets,
+            ai_memory,
             admins: Some(admins),
         })
     }
@@ -706,6 +766,13 @@ impl Db {
                 params![secret.user_id, secret.name, secret.value, secret.updated_at],
             )?;
         }
+        for row in &snapshot.ai_memory {
+            tx.execute(
+                "INSERT INTO user_ai_memory (user_id, revision, document, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![row.user_id, row.revision, row.document, row.updated_at],
+            )?;
+        }
         if let Some(admins) = &snapshot.admins {
             tx.execute("DELETE FROM server_admin", [])?;
             for admin in admins {
@@ -733,6 +800,7 @@ pub struct Snapshot {
     pub refresh_tokens: Vec<SnapshotRefresh>,
     pub settings: Vec<SnapshotSettings>,
     pub secrets: Vec<SnapshotSecret>,
+    pub ai_memory: Vec<SnapshotSettings>,
     /// `None` means this backup did not mention the server admin, so import leaves it alone.
     pub admins: Option<Vec<SnapshotAdmin>>,
 }
@@ -840,7 +908,9 @@ mod tests {
         let user = db.create_user("ada", "correct-password").unwrap();
         assert!(db.get_settings(&user.id).unwrap().is_none());
 
-        let missing = db.put_settings(&user.id, Some(1), r#"{"title":"x"}"#).unwrap();
+        let missing = db
+            .put_settings(&user.id, Some(1), r#"{"title":"x"}"#)
+            .unwrap();
         assert!(matches!(missing, SettingsWrite::Missing));
 
         let created = db

@@ -25,6 +25,9 @@ pub struct BackupFile {
     pub refresh_tokens: Vec<BackupRefresh>,
     pub settings: Vec<BackupSettings>,
     pub secrets: Vec<BackupSecret>,
+    /// Caption fixes for the local AI. Missing on backups from before that existed.
+    #[serde(default)]
+    pub ai_memory: Option<Vec<BackupSettings>>,
     /// Missing on older backups. Import then leaves the server admin account alone.
     #[serde(default)]
     pub server_admins: Option<Vec<BackupAdmin>>,
@@ -98,7 +101,8 @@ pub fn export_path(db: &Db, path: &Path) -> Result<(), String> {
 }
 
 pub fn import_str(db: &Db, raw: &str) -> Result<(), String> {
-    let file: BackupFile = serde_json::from_str(raw).map_err(|err| format!("backup is not valid JSON: {err}"))?;
+    let file: BackupFile =
+        serde_json::from_str(raw).map_err(|err| format!("backup is not valid JSON: {err}"))?;
     file.validate()?;
     let snapshot = file.into_snapshot();
     db.import_snapshot(&snapshot).map_err(|err| err.to_string())
@@ -161,6 +165,18 @@ impl BackupFile {
                     updated_at: secret.updated_at,
                 })
                 .collect(),
+            ai_memory: Some(
+                snapshot
+                    .ai_memory
+                    .into_iter()
+                    .map(|row| BackupSettings {
+                        user_id: row.user_id,
+                        revision: row.revision,
+                        document: row.document,
+                        updated_at: row.updated_at,
+                    })
+                    .collect(),
+            ),
             server_admins: snapshot.admins.map(|admins| {
                 admins
                     .into_iter()
@@ -178,7 +194,10 @@ impl BackupFile {
 
     fn validate(&self) -> Result<(), String> {
         if self.format != FORMAT {
-            return Err(format!("not a Command Center auth-server backup ({})", self.format));
+            return Err(format!(
+                "not a Command Center auth-server backup ({})",
+                self.format
+            ));
         }
         if self.version != VERSION {
             return Err(format!(
@@ -188,7 +207,8 @@ impl BackupFile {
         }
         let mut ids = std::collections::BTreeSet::new();
         for user in &self.users {
-            if user.id.is_empty() || user.username_norm.is_empty() || user.password_hash.is_empty() {
+            if user.id.is_empty() || user.username_norm.is_empty() || user.password_hash.is_empty()
+            {
                 return Err("backup user is missing an id, username, or password hash".into());
             }
             if !ids.insert(user.id.clone()) {
@@ -257,6 +277,17 @@ impl BackupFile {
                     updated_at: secret.updated_at,
                 })
                 .collect(),
+            ai_memory: self
+                .ai_memory
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| SnapshotSettings {
+                    user_id: row.user_id,
+                    revision: row.revision,
+                    document: row.document,
+                    updated_at: row.updated_at,
+                })
+                .collect(),
             admins: self.server_admins.map(|admins| {
                 admins
                     .into_iter()
@@ -292,17 +323,26 @@ mod tests {
     fn export_import_keeps_login_boards_and_secrets() {
         let (db, path) = temp_db();
         let user = db.create_user("Ada", "correct-password").unwrap();
-        db.put_settings(&user.id, None, r#"{"title":"Ops"}"#).unwrap();
+        db.put_settings(&user.id, None, r#"{"title":"Ops"}"#)
+            .unwrap();
+        db.put_ai_memory(
+            &user.id,
+            None,
+            r#"{"version":1,"corrections":[{"id":"c1","heard":"engine twelve","says":"Engine 12","count":1}]}"#,
+        )
+        .unwrap();
         let mut secrets = BTreeMap::new();
         secrets.insert("broadcastify.password".into(), "feed-secret".into());
         secrets.insert("socrata.app_token".into(), "token-1".into());
         db.replace_secrets(&user.id, &secrets).unwrap();
-        db.set_server_admin("server-admin", "server-admin-pass").unwrap();
+        db.set_server_admin("server-admin", "server-admin-pass")
+            .unwrap();
 
         let raw = export_string(&db).unwrap();
         assert!(raw.contains("command-center-auth-backup"));
         assert!(raw.contains("feed-secret"));
         assert!(raw.contains("serverAdmins"));
+        assert!(raw.contains("Engine 12"));
         assert!(!raw.contains("correct-password"));
         assert!(!raw.contains("server-admin-pass"));
 
@@ -315,23 +355,43 @@ mod tests {
         assert!(other.find_user_by_username("gone").unwrap().is_none());
         let settings = other.get_settings(&restored.id).unwrap().unwrap();
         assert!(settings.document.contains("Ops"));
+        let memory = other.get_ai_memory(&restored.id).unwrap().unwrap();
+        assert!(memory.document.contains("Engine 12"));
+        assert_eq!(memory.revision, 1);
         assert_eq!(settings.revision, 1);
         let stored = other.list_secrets(&restored.id).unwrap();
-        assert_eq!(stored.get("broadcastify.password").map(String::as_str), Some("feed-secret"));
-        assert_eq!(stored.get("socrata.app_token").map(String::as_str), Some("token-1"));
+        assert_eq!(
+            stored.get("broadcastify.password").map(String::as_str),
+            Some("feed-secret")
+        );
+        assert_eq!(
+            stored.get("socrata.app_token").map(String::as_str),
+            Some("token-1")
+        );
         let restored_admin = other.server_admin().unwrap().unwrap();
         assert_eq!(restored_admin.username, "server-admin");
-        assert!(Db::verify_password_hash(&restored_admin.password_hash, "server-admin-pass").unwrap());
-        assert!(other.find_user_by_username("server-admin").unwrap().is_none());
+        assert!(
+            Db::verify_password_hash(&restored_admin.password_hash, "server-admin-pass").unwrap()
+        );
+        assert!(other
+            .find_user_by_username("server-admin")
+            .unwrap()
+            .is_none());
 
         let mut old: serde_json::Value = serde_json::from_str(&raw).unwrap();
         old.as_object_mut().unwrap().remove("serverAdmins");
-        other.set_server_admin("keep-me", "keep-me-password").unwrap();
+        old.as_object_mut().unwrap().remove("aiMemory");
+        other
+            .set_server_admin("keep-me", "keep-me-password")
+            .unwrap();
         import_str(&other, &serde_json::to_string(&old).unwrap()).unwrap();
         assert_eq!(other.server_admin().unwrap().unwrap().username, "keep-me");
+        assert!(other.get_ai_memory(&restored.id).unwrap().is_none());
 
         let bad = r#"{"format":"nope","version":1,"exportedAt":0,"users":[],"refreshTokens":[],"settings":[],"secrets":[]}"#;
-        assert!(import_str(&other, bad).unwrap_err().contains("not a Command Center"));
+        assert!(import_str(&other, bad)
+            .unwrap_err()
+            .contains("not a Command Center"));
 
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(other_path);
