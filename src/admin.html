@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Command Center server</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0d10;
+      --surface: #14181d;
+      --border: #2a313a;
+      --text: #e7ebf0;
+      --muted: #9aa3ad;
+      --accent: #3d9cf0;
+      --danger: #e15b64;
+      --ok: #3cb371;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 15px/1.45 "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    main { max-width: 720px; margin: 0 auto; padding: 28px 16px 48px; }
+    h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 6px; }
+    h2 { font-size: 0.95rem; margin: 28px 0 8px; }
+    p { color: var(--muted); margin: 0 0 12px; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    label { display: block; font-size: 0.82rem; margin: 12px 0 4px; }
+    input[type="text"], input[type="password"] {
+      width: 100%;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+    }
+    button, .btn {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 7px 12px;
+      cursor: pointer;
+    }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #071018; }
+    button.danger { color: var(--danger); }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+    .check { display: flex; gap: 8px; align-items: flex-start; color: var(--muted); margin-top: 12px; }
+    .alert { margin-top: 12px; padding: 8px 10px; border-radius: 6px; }
+    .alert.error { background: rgba(225, 91, 100, 0.12); color: #ffb4b8; }
+    .alert.ok { background: rgba(60, 179, 113, 0.12); color: #b6ebc9; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px 4px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
+    .hidden { display: none; }
+    code { color: var(--text); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Command Center server</h1>
+    <p id="lead">This screen is for the server and its settings. It is not a Command Center board login.</p>
+
+    <section id="login" class="card">
+      <h2 style="margin-top:0">Server admin</h2>
+      <p>Sign in with the server admin created during setup. That account cannot sign in to a Command Center board, and a board account cannot open these settings.</p>
+      <label for="admin-user">Server admin username</label>
+      <input id="admin-user" type="text" autocomplete="username" />
+      <label for="admin-pass">Server admin password</label>
+      <input id="admin-pass" type="password" autocomplete="current-password" />
+      <div class="row">
+        <button class="primary" id="sign-in" type="button">Open server settings</button>
+      </div>
+      <div id="login-message"></div>
+    </section>
+
+    <section id="app" class="hidden">
+      <div class="card">
+        <h2 style="margin-top:0">Board accounts</h2>
+        <p>These are Command Center board logins. They are separate from the server admin.</p>
+        <table>
+          <thead><tr><th>Username</th><th></th></tr></thead>
+          <tbody id="users"></tbody>
+        </table>
+        <label for="board-user">New board username</label>
+        <input id="board-user" type="text" autocomplete="off" />
+        <label for="board-pass">Board password</label>
+        <input id="board-pass" type="password" autocomplete="new-password" />
+        <div class="row">
+          <button class="primary" id="add-user" type="button">Add board account</button>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <h2 style="margin-top:0">Server settings</h2>
+        <p id="readonly"></p>
+        <label class="check"><input id="allow-register" type="checkbox" /> <span>Let Command Center create new board accounts from the sign-in screen</span></label>
+        <label class="check"><input id="secret-store" type="checkbox" /> <span>Store source passwords and API keys on this server. Only for a server that stays on this computer.</span></label>
+        <div class="row">
+          <button class="primary" id="save-settings" type="button">Save settings</button>
+        </div>
+        <h2>How the server starts</h2>
+        <p>A Windows service stays running with no taskbar icon. Start at login shows an icon in the taskbar. Changing this may ask Windows for administrator approval.</p>
+        <div class="row">
+          <button type="button" id="use-service">Run as a Windows service</button>
+          <button type="button" id="use-login">Start at login</button>
+        </div>
+        <h2>Server admin password</h2>
+        <p>This changes the server admin only. It does not change any Command Center board password.</p>
+        <label for="current-pass">Current server admin password</label>
+        <input id="current-pass" type="password" autocomplete="current-password" />
+        <label for="new-pass">New server admin password</label>
+        <input id="new-pass" type="password" autocomplete="new-password" />
+        <div class="row">
+          <button id="change-pass" type="button">Change server admin password</button>
+          <button id="sign-out" type="button">Sign out</button>
+        </div>
+      </div>
+      <div id="app-message"></div>
+    </section>
+  </main>
+  <script>
+    const tokenKey = "command-center.server-admin";
+    const login = document.getElementById("login");
+    const app = document.getElementById("app");
+
+    function message(node, kind, text) {
+      node.className = "alert " + kind;
+      node.textContent = text;
+    }
+
+    async function api(path, options) {
+      const headers = { "Content-Type": "application/json" };
+      const token = sessionStorage.getItem(tokenKey);
+      if (token) headers.Authorization = "Bearer " + token;
+      const response = await fetch(path, { ...options, headers });
+      const text = await response.text();
+      let body = null;
+      if (text) {
+        try { body = JSON.parse(text); } catch { body = { error: text }; }
+      }
+      if (response.status === 401) {
+        sessionStorage.removeItem(tokenKey);
+        showLogin();
+        throw new Error("That server admin sign-in was not accepted.");
+      }
+      if (!response.ok) {
+        throw new Error(body && body.error ? body.error : "Request failed");
+      }
+      return body;
+    }
+
+    function showLogin() {
+      login.classList.remove("hidden");
+      app.classList.add("hidden");
+    }
+
+    function showApp() {
+      login.classList.add("hidden");
+      app.classList.remove("hidden");
+    }
+
+    async function refresh() {
+      const settings = await api("/admin/api/settings");
+      const users = await api("/admin/api/users");
+      const startup = settings.startup === "service"
+        ? "Windows service"
+        : settings.startup === "login"
+          ? "Starts at login, with a taskbar icon"
+          : "Not set";
+      document.getElementById("readonly").textContent =
+        "Mode: " + settings.mode + ". Listening on " + settings.bind + ". Startup: " + startup + ".";
+      document.getElementById("allow-register").checked = !!settings.allowRegister;
+      const secrets = document.getElementById("secret-store");
+      secrets.checked = !!settings.secretStore;
+      secrets.disabled = !settings.secretStoreAllowed;
+      const body = document.getElementById("users");
+      body.replaceChildren();
+      for (const user of users.users || []) {
+        const row = document.createElement("tr");
+        const name = document.createElement("td");
+        name.textContent = user.username;
+        const actions = document.createElement("td");
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "danger";
+        remove.textContent = "Remove board account";
+        remove.addEventListener("click", async () => {
+          if (!confirm("Remove the board account " + user.username + "? This does not change the server admin.")) return;
+          try {
+            await api("/admin/api/users/" + encodeURIComponent(user.id), { method: "DELETE" });
+            await refresh();
+          } catch (err) {
+            message(document.getElementById("app-message"), "error", err.message);
+          }
+        });
+        actions.append(remove);
+        row.append(name, actions);
+        body.append(row);
+      }
+      showApp();
+    }
+
+    document.getElementById("sign-in").addEventListener("click", async () => {
+      const node = document.getElementById("login-message");
+      node.textContent = "";
+      try {
+        const session = await api("/admin/api/login", {
+          method: "POST",
+          body: JSON.stringify({
+            username: document.getElementById("admin-user").value,
+            password: document.getElementById("admin-pass").value,
+          }),
+        });
+        if (session.tokenType !== "server-admin") {
+          throw new Error("This sign-in is not a server admin.");
+        }
+        sessionStorage.setItem(tokenKey, session.accessToken);
+        document.getElementById("admin-pass").value = "";
+        await refresh();
+      } catch (err) {
+        message(node, "error", err.message === "invalid_credentials"
+          ? "That username and password do not match the server admin. A Command Center board login will not work here."
+          : err.message);
+      }
+    });
+
+    document.getElementById("add-user").addEventListener("click", async () => {
+      try {
+        await api("/admin/api/users", {
+          method: "POST",
+          body: JSON.stringify({
+            username: document.getElementById("board-user").value,
+            password: document.getElementById("board-pass").value,
+          }),
+        });
+        document.getElementById("board-user").value = "";
+        document.getElementById("board-pass").value = "";
+        message(document.getElementById("app-message"), "ok", "Board account added. It can sign in to Command Center. It is not a server admin.");
+        await refresh();
+      } catch (err) {
+        message(document.getElementById("app-message"), "error", err.message);
+      }
+    });
+
+    document.getElementById("save-settings").addEventListener("click", async () => {
+      try {
+        await api("/admin/api/settings", {
+          method: "PUT",
+          body: JSON.stringify({
+            allowRegister: document.getElementById("allow-register").checked,
+            secretStore: document.getElementById("secret-store").checked,
+          }),
+        });
+        message(document.getElementById("app-message"), "ok", "Server settings saved.");
+        await refresh();
+      } catch (err) {
+        message(document.getElementById("app-message"), "error", err.message);
+      }
+    });
+
+    async function setStartup(startup) {
+      try {
+        await api("/admin/api/startup", {
+          method: "PUT",
+          body: JSON.stringify({ startup }),
+        });
+        message(document.getElementById("app-message"), "ok", startup === "service"
+          ? "The server will run as a Windows service."
+          : "The server will start when you sign in and show a taskbar icon.");
+        await refresh();
+      } catch (err) {
+        message(document.getElementById("app-message"), "error", err.message);
+      }
+    }
+    document.getElementById("use-service").addEventListener("click", () => setStartup("service"));
+    document.getElementById("use-login").addEventListener("click", () => setStartup("login"));
+
+    document.getElementById("change-pass").addEventListener("click", async () => {
+      try {
+        await api("/admin/api/password", {
+          method: "POST",
+          body: JSON.stringify({
+            currentPassword: document.getElementById("current-pass").value,
+            newPassword: document.getElementById("new-pass").value,
+          }),
+        });
+        document.getElementById("current-pass").value = "";
+        document.getElementById("new-pass").value = "";
+        message(document.getElementById("app-message"), "ok", "Server admin password changed. Board passwords were not changed.");
+      } catch (err) {
+        message(document.getElementById("app-message"), "error", err.message);
+      }
+    });
+
+    document.getElementById("sign-out").addEventListener("click", () => {
+      sessionStorage.removeItem(tokenKey);
+      showLogin();
+    });
+
+    if (sessionStorage.getItem(tokenKey)) {
+      refresh().catch(() => showLogin());
+    }
+  </script>
+</body>
+</html>
