@@ -6,7 +6,7 @@ Repo: [`nlaero/command-center-auth`](https://github.com/nlaero/command-center-au
 
 Users sign up from the desktop app via `POST /auth/register`. `authctl create-user` is host recovery only.
 
-Does **not** store Broadcastify or other source API credentials. Those stay on the desktop keyring.
+Does **not** store Broadcastify or other source API credentials. Those stay on the desktop keyring. `GET` / `PUT /settings` stores that user's board and source setup (secret *names* are fine; secret *values* are rejected).
 
 ## API
 
@@ -18,6 +18,8 @@ Does **not** store Broadcastify or other source API credentials. Those stay on t
 | `POST` | `/auth/refresh` | `{ refreshToken }` → rotated pair |
 | `POST` | `/auth/logout` | `{ refreshToken? }` → 204 |
 | `GET` | `/auth/me` | Bearer access → `{ id, username }` |
+| `GET` | `/settings` | Bearer access → board document, or 404 |
+| `PUT` | `/settings` | Bearer access. `{ revision, document }` → saved, or 409 with the current document |
 
 Contract: [`openapi.yaml`](./openapi.yaml).
 
@@ -50,6 +52,6 @@ Lab JWTs are HS256 with `AUTH_JWT_SECRET`. Move to Ed25519/RS256 before anything
 
 ## Status
 
-Working: register, login, refresh, logout, me; Argon2id; SQLite; refresh rotation + reuse revoke; basic rate limit.
+Working: register, login, refresh, logout, me; per-user board document at `/settings`; Argon2id; SQLite; refresh rotation + reuse revoke; basic rate limit.
 
 Not yet: asymmetric JWT, TTY-hidden `authctl` passwords, production-grade rate limits. Desktop register UI ships with the Command Center auth client.

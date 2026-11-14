@@ -113,6 +113,57 @@ paths:
                 $ref: "#/components/schemas/User"
         "401":
           $ref: "#/components/responses/Error"
+  /settings:
+    get:
+      summary: Board and source setup for the signed-in user
+      operationId: getSettings
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Stored document
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SettingsDocument"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+    put:
+      summary: Replace the signed-in user's board document
+      description: |
+        `revision` is the last revision this client saved, or null to create.
+        A mismatch returns 409 with the current document. Secret values are rejected;
+        the `secrets` array may list key names only.
+      operationId: putSettings
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PutSettingsRequest"
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SettingsDocument"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          description: Revision conflict; body is the current document
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SettingsConflict"
 components:
   securitySchemes:
     bearerAuth:
@@ -192,4 +243,36 @@ components:
             - weak_password
             - registration_disabled
             - bad_request
+            - not_found
+            - conflict
             - internal
+    SettingsDocument:
+      type: object
+      required: [revision, updatedAt, document]
+      properties:
+        revision:
+          type: integer
+        updatedAt:
+          type: integer
+          description: Unix seconds
+        document:
+          type: object
+          description: Board, layout, and source setup. No secret values.
+    PutSettingsRequest:
+      type: object
+      required: [document]
+      properties:
+        revision:
+          type: integer
+          nullable: true
+        document:
+          type: object
+    SettingsConflict:
+      allOf:
+        - $ref: "#/components/schemas/SettingsDocument"
+        - type: object
+          required: [error]
+          properties:
+            error:
+              type: string
+              enum: [conflict]
