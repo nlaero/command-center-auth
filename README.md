@@ -1,15 +1,15 @@
 # auth-server
 
-Username/password auth for [Command Center](https://github.com/nlaero/CommandCenter): self-register, login, refresh, logout. Rust (Axum) + SQLite + Argon2id.
+Future multi-user server for [Command Center](https://github.com/nlaero/CommandCenter). On that repo, `main` is the single-user app: no login, settings and AI data on the device. The [`multi-user`](https://github.com/nlaero/CommandCenter/tree/multi-user) branch is the future server version. This server can run on that computer or on another machine. It is not part of the single-user app. Shared caption memory (`/ai/memory`) belongs with `multi-user`, not with `main`.
 
-Repo: [`nlaero/command-center-auth`](https://github.com/nlaero/command-center-auth). Binary and service name: `auth-server`. A Fedora Pi (or any LAN Linux host) is fine for testing — that is not the product name.
+This repository holds that later server: username and password, Rust (Axum) + SQLite + Argon2id. The program name is `auth-server`. A Fedora Pi (or any LAN Linux host) is fine for testing — that is not the product name.
 
-Users sign up from the desktop app via `POST /auth/register`. `authctl create-user` is host recovery only.
+Accounts are created with `POST /auth/register`. `authctl create-user` is host recovery only. The current Command Center build does not call this server.
 
-Two ways to run it:
+When the multi-user app is built, the server can run in either place:
 
 - **This computer only** (`AUTH_MODE=device`, bound to `127.0.0.1`). Other machines cannot connect. This mode may store source passwords and API keys (`AUTH_SECRET_STORE=true`, `GET` / `PUT /vault`).
-- **A server for other devices** (`AUTH_MODE=shared`). Command Center on other computers signs in here. Passwords and API keys stay on each computer. The vault route answers `403 secret_store_disabled`.
+- **Another machine** (`AUTH_MODE=shared`). Other computers would sign in here. Passwords and API keys stay on each computer. The vault route answers `403 secret_store_disabled`.
 
 `GET` / `PUT /settings` is the board and source setup. Secret *names* are fine in that document. Secret *values* are rejected there even when the vault is on.
 
@@ -100,4 +100,4 @@ Lab JWTs are HS256 with `AUTH_JWT_SECRET`. Move to Ed25519/RS256 before anything
 
 Working: register, login, refresh, logout, me; per-user board document at `/settings`; caption fixes at `/ai/memory`; device-only secret vault; backup export/import; Argon2id; SQLite; refresh rotation + reuse revoke; basic rate limit.
 
-Not yet: asymmetric JWT, TTY-hidden `authctl` passwords, production-grade rate limits. Desktop register UI ships with the Command Center auth client.
+Not yet: the multi-user app itself, asymmetric JWT, TTY-hidden `authctl` passwords, production-grade rate limits. The current single-user Command Center does not sign in here.
