@@ -4,7 +4,10 @@ info:
   version: 0.1.0
   description: |
     Username/password self-register, login, and token issuance for Command Center desktop.
-    Does not store Broadcastify or other source API credentials.
+    A device server (this computer only) may store source passwords and API keys at /vault.
+    A shared server, for other devices, does not. Board documents still reject secret values.
+    /admin is a separate server-admin sign-in for server settings. It is not a board login,
+    and a board token is rejected there. The server admin token is rejected by /auth/me.
 servers:
   - url: https://auth-server.local:8443
     description: LAN auth-server (example hostname)
@@ -20,6 +23,49 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+  /vault:
+    get:
+      summary: Read source passwords and API keys for the signed-in user
+      description: Only when this server is device-only and secret storage is on. Otherwise 403.
+      operationId: readVault
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Stored secrets for this account
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Vault"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+    put:
+      summary: Replace source passwords and API keys for the signed-in user
+      description: Session tokens are rejected. A shared server always returns 403.
+      operationId: writeVault
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Vault"
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Vault"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
   /auth/register:
     post:
       summary: Self-register (primary signup from Command Center)
@@ -178,6 +224,15 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorBody"
   schemas:
+    Vault:
+      type: object
+      required: [secrets]
+      properties:
+        secrets:
+          type: object
+          additionalProperties:
+            type: string
+          description: Source secret name to value. Not the account password, and not session tokens.
     HealthResponse:
       type: object
       required: [ok, service]
@@ -187,6 +242,13 @@ components:
         service:
           type: string
           example: auth-server
+        mode:
+          type: string
+          enum: [device, shared]
+          description: device is this computer only. shared is a server other devices can use.
+        secretStore:
+          type: boolean
+          description: True only when mode is device and secret storage was turned on.
     LoginRequest:
       type: object
       required: [username, password]
@@ -245,6 +307,7 @@ components:
             - bad_request
             - not_found
             - conflict
+            - secret_store_disabled
             - internal
     SettingsDocument:
       type: object

@@ -44,6 +44,45 @@ fn main() {
                 }
             }
         }
+        "backup" => {
+            let sub = args.next().unwrap_or_default();
+            let file = args.next().unwrap_or_else(|| {
+                eprintln!("usage: authctl backup export <file>");
+                eprintln!("       authctl backup import <file> --yes");
+                process::exit(2);
+            });
+            let yes = args.any(|arg| arg == "--yes");
+            let cfg_db = db_path_or_exit();
+            let db = Db::open(&cfg_db).unwrap_or_else(|e| {
+                eprintln!("db error: {e}");
+                process::exit(1);
+            });
+            match sub.as_str() {
+                "export" => {
+                    if let Err(err) = auth_server::backup::export_path(&db, std::path::Path::new(&file)) {
+                        eprintln!("backup export failed: {err}");
+                        process::exit(1);
+                    }
+                    println!("{file}");
+                }
+                "import" => {
+                    if !yes {
+                        eprintln!("backup import replaces every account on this server. Re-run with --yes");
+                        process::exit(2);
+                    }
+                    if let Err(err) = auth_server::backup::import_path(&db, std::path::Path::new(&file)) {
+                        eprintln!("backup import failed: {err}");
+                        process::exit(1);
+                    }
+                    println!("imported {file}");
+                }
+                _ => {
+                    eprintln!("usage: authctl backup export <file>");
+                    eprintln!("       authctl backup import <file> --yes");
+                    process::exit(2);
+                }
+            }
+        }
         "rotate-keys" => {
             eprintln!(
                 "Lab HS256: set a new AUTH_JWT_SECRET in the environment / unit file and restart auth-server.\n\
@@ -57,6 +96,14 @@ fn main() {
             usage();
             process::exit(2);
         }
+    }
+}
+
+fn db_path_or_exit() -> std::path::PathBuf {
+    let _ = load_dotenv(".env");
+    match env::var("AUTH_DB") {
+        Ok(path) if !path.trim().is_empty() => std::path::PathBuf::from(path),
+        _ => std::path::PathBuf::from("./data/auth-server.db"),
     }
 }
 
@@ -75,9 +122,13 @@ fn usage() {
          or the DB needs a repair account.\n\n\
          Commands:\n\
            create-user <username>   Host recovery: create a user (Argon2id)\n\
+           backup export <file>     Write a backup (accounts, boards, stored secrets)\n\
+           backup import <file> --yes\n\
+                                    Replace this server's accounts with a backup\n\
            rotate-keys              Print JWT secret rotation instructions\n\
            help                     Show this help\n\n\
-         Uses AUTH_DB / AUTH_JWT_SECRET from the environment or .env"
+         Stop auth-server before import. Uses AUTH_DB from the environment or .env.\n\
+         backup does not need AUTH_JWT_SECRET. create-user does."
     );
 }
 

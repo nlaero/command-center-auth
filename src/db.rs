@@ -5,9 +5,11 @@ use chrono::{Duration, Utc};
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration as StdDuration;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -31,6 +33,22 @@ pub struct UserRow {
     pub username: String,
     pub username_norm: String,
     pub password_hash: String,
+}
+
+/// Server settings login. Not a Command Center board account.
+#[derive(Clone, Debug)]
+pub struct ServerAdmin {
+    pub id: String,
+    pub username: String,
+    pub username_norm: String,
+    pub password_hash: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ListedUser {
+    pub id: String,
+    pub username: String,
+    pub created_at: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -96,8 +114,27 @@ impl Db {
               document TEXT NOT NULL,
               updated_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS user_secrets (
+              user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              name TEXT NOT NULL,
+              value TEXT NOT NULL,
+              updated_at INTEGER NOT NULL,
+              PRIMARY KEY (user_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS server_admin (
+              id TEXT PRIMARY KEY NOT NULL,
+              username TEXT NOT NULL,
+              username_norm TEXT NOT NULL UNIQUE,
+              password_hash TEXT NOT NULL,
+              created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS server_settings (
+              key TEXT PRIMARY KEY NOT NULL,
+              value TEXT NOT NULL
+            );
             ",
         )?;
+        conn.busy_timeout(StdDuration::from_secs(5))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -176,11 +213,138 @@ impl Db {
     }
 
     pub fn verify_password(user: &UserRow, password: &str) -> Result<bool, DbError> {
-        let parsed = PasswordHash::new(&user.password_hash)
-            .map_err(|e| DbError::Password(e.to_string()))?;
+        Self::verify_password_hash(&user.password_hash, password)
+    }
+
+    pub fn verify_password_hash(hash: &str, password: &str) -> Result<bool, DbError> {
+        let parsed = PasswordHash::new(hash).map_err(|e| DbError::Password(e.to_string()))?;
         Ok(Argon2::default()
             .verify_password(password.as_bytes(), &parsed)
             .is_ok())
+    }
+
+    /// The server admin can open server settings. It is not a Command Center board login.
+    pub fn set_server_admin(&self, username: &str, password: &str) -> Result<ServerAdmin, DbError> {
+        let display = username.trim();
+        if display.is_empty() {
+            return Err(DbError::Password("username required".into()));
+        }
+        let norm = normalize_username(display);
+        let password_hash = hash_password(password)?;
+        let now = Utc::now().timestamp();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let existing: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT id, created_at FROM server_admin WHERE username_norm = ?1",
+                params![norm],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (id, created_at) = existing.unwrap_or_else(|| (Uuid::new_v4().to_string(), now));
+        tx.execute("DELETE FROM server_admin", [])?;
+        tx.execute(
+            "INSERT INTO server_admin (id, username, username_norm, password_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, display, norm, password_hash, created_at],
+        )?;
+        tx.commit()?;
+        Ok(ServerAdmin {
+            id,
+            username: display.to_string(),
+            username_norm: norm,
+            password_hash,
+        })
+    }
+
+    pub fn server_admin(&self) -> Result<Option<ServerAdmin>, DbError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, username, username_norm, password_hash FROM server_admin LIMIT 1",
+            [],
+            |row| {
+                Ok(ServerAdmin {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    username_norm: row.get(2)?,
+                    password_hash: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(DbError::from)
+    }
+
+    pub fn list_users(&self) -> Result<Vec<ListedUser>, DbError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, username, created_at FROM users ORDER BY username_norm",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ListedUser {
+                id: row.get(0)?,
+                username: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+    }
+
+    pub fn set_user_password(&self, user_id: &str, password: &str) -> Result<(), DbError> {
+        let password_hash = hash_password(password)?;
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE users SET password_hash = ?1 WHERE id = ?2",
+            params![password_hash, user_id],
+        )?;
+        if changed == 0 {
+            return Err(DbError::Password("user not found".into()));
+        }
+        Ok(())
+    }
+
+    pub fn delete_user(&self, user_id: &str) -> Result<bool, DbError> {
+        let conn = self.lock()?;
+        let changed = conn.execute("DELETE FROM users WHERE id = ?1", params![user_id])?;
+        Ok(changed > 0)
+    }
+
+    pub fn revoke_user_sessions(&self, user_id: &str) -> Result<(), DbError> {
+        let now = Utc::now().timestamp();
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE refresh_tokens SET revoked_at = ?1 WHERE user_id = ?2 AND revoked_at IS NULL",
+            params![now, user_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn setting(&self, key: &str) -> Result<Option<String>, DbError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT value FROM server_settings WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(DbError::from)
+    }
+
+    pub fn setting_bool(&self, key: &str, fallback: bool) -> bool {
+        match self.setting(key) {
+            Ok(Some(value)) => matches!(value.as_str(), "1" | "true" | "yes" | "on"),
+            _ => fallback,
+        }
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), DbError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO server_settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     pub fn issue_refresh(
@@ -363,6 +527,260 @@ impl Db {
         }
         Ok(outcome)
     }
+
+    pub fn list_secrets(&self, user_id: &str) -> Result<BTreeMap<String, String>, DbError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, value FROM user_secrets WHERE user_id = ?1 ORDER BY name",
+        )?;
+        let rows = stmt.query_map(params![user_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (name, value) = row?;
+            out.insert(name, value);
+        }
+        Ok(out)
+    }
+
+    pub fn replace_secrets(
+        &self,
+        user_id: &str,
+        secrets: &BTreeMap<String, String>,
+    ) -> Result<(), DbError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM user_secrets WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        let now = Utc::now().timestamp();
+        for (name, value) in secrets {
+            tx.execute(
+                "INSERT INTO user_secrets (user_id, name, value, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![user_id, name, value, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn export_snapshot(&self) -> Result<Snapshot, DbError> {
+        let conn = self.lock()?;
+        let users = {
+            let mut stmt = conn.prepare(
+                "SELECT id, username, username_norm, password_hash, created_at
+                 FROM users ORDER BY username_norm",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(SnapshotUser {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    username_norm: row.get(2)?,
+                    password_hash: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let refresh_tokens = {
+            let mut stmt = conn.prepare(
+                "SELECT id, user_id, family_id, token_hash, expires_at, created_at, revoked_at, replaced_by
+                 FROM refresh_tokens ORDER BY created_at",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(SnapshotRefresh {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    family_id: row.get(2)?,
+                    token_hash: row.get(3)?,
+                    expires_at: row.get(4)?,
+                    created_at: row.get(5)?,
+                    revoked_at: row.get(6)?,
+                    replaced_by: row.get(7)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let settings = {
+            let mut stmt = conn.prepare(
+                "SELECT user_id, revision, document, updated_at FROM user_settings ORDER BY user_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(SnapshotSettings {
+                    user_id: row.get(0)?,
+                    revision: row.get(1)?,
+                    document: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let secrets = {
+            let mut stmt = conn.prepare(
+                "SELECT user_id, name, value, updated_at FROM user_secrets ORDER BY user_id, name",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(SnapshotSecret {
+                    user_id: row.get(0)?,
+                    name: row.get(1)?,
+                    value: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let admins = {
+            let mut stmt = conn.prepare(
+                "SELECT id, username, username_norm, password_hash, created_at
+                 FROM server_admin ORDER BY username_norm",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(SnapshotAdmin {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    username_norm: row.get(2)?,
+                    password_hash: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(Snapshot {
+            users,
+            refresh_tokens,
+            settings,
+            secrets,
+            admins: Some(admins),
+        })
+    }
+
+    /// Replace accounts, sessions, boards, and stored secrets with a snapshot.
+    pub fn import_snapshot(&self, snapshot: &Snapshot) -> Result<(), DbError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM users", [])?;
+        for user in &snapshot.users {
+            tx.execute(
+                "INSERT INTO users (id, username, username_norm, password_hash, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    user.id,
+                    user.username,
+                    user.username_norm,
+                    user.password_hash,
+                    user.created_at
+                ],
+            )?;
+        }
+        for token in &snapshot.refresh_tokens {
+            tx.execute(
+                "INSERT INTO refresh_tokens
+                 (id, user_id, family_id, token_hash, expires_at, created_at, revoked_at, replaced_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    token.id,
+                    token.user_id,
+                    token.family_id,
+                    token.token_hash,
+                    token.expires_at,
+                    token.created_at,
+                    token.revoked_at,
+                    token.replaced_by
+                ],
+            )?;
+        }
+        for row in &snapshot.settings {
+            tx.execute(
+                "INSERT INTO user_settings (user_id, revision, document, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![row.user_id, row.revision, row.document, row.updated_at],
+            )?;
+        }
+        for secret in &snapshot.secrets {
+            tx.execute(
+                "INSERT INTO user_secrets (user_id, name, value, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![secret.user_id, secret.name, secret.value, secret.updated_at],
+            )?;
+        }
+        if let Some(admins) = &snapshot.admins {
+            tx.execute("DELETE FROM server_admin", [])?;
+            for admin in admins {
+                tx.execute(
+                    "INSERT INTO server_admin (id, username, username_norm, password_hash, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        admin.id,
+                        admin.username,
+                        admin.username_norm,
+                        admin.password_hash,
+                        admin.created_at
+                    ],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    pub users: Vec<SnapshotUser>,
+    pub refresh_tokens: Vec<SnapshotRefresh>,
+    pub settings: Vec<SnapshotSettings>,
+    pub secrets: Vec<SnapshotSecret>,
+    /// `None` means this backup did not mention the server admin, so import leaves it alone.
+    pub admins: Option<Vec<SnapshotAdmin>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SnapshotUser {
+    pub id: String,
+    pub username: String,
+    pub username_norm: String,
+    pub password_hash: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct SnapshotRefresh {
+    pub id: String,
+    pub user_id: String,
+    pub family_id: String,
+    pub token_hash: String,
+    pub expires_at: i64,
+    pub created_at: i64,
+    pub revoked_at: Option<i64>,
+    pub replaced_by: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SnapshotSettings {
+    pub user_id: String,
+    pub revision: i64,
+    pub document: String,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct SnapshotSecret {
+    pub user_id: String,
+    pub name: String,
+    pub value: String,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct SnapshotAdmin {
+    pub id: String,
+    pub username: String,
+    pub username_norm: String,
+    pub password_hash: String,
+    pub created_at: i64,
 }
 
 fn settings_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SettingsRow> {
