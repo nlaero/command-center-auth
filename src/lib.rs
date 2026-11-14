@@ -90,6 +90,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/settings", get(read_settings).put(write_settings))
+        .route("/ai/memory", get(read_ai_memory).put(write_ai_memory))
         .merge(admin::routes())
         .with_state(state)
 }
@@ -159,11 +160,7 @@ async fn register(
     }
 
     let ip = client_ip(&headers);
-    let key = format!(
-        "reg:{}:{}",
-        ip,
-        crate::db::normalize_username(username)
-    );
+    let key = format!("reg:{}:{}", ip, crate::db::normalize_username(username));
     let window = Duration::from_secs(state.cfg.login_rate_window_secs);
     if !state
         .limiter
@@ -369,6 +366,126 @@ async fn write_settings(
     }
 }
 
+const MAX_AI_MEMORY_BYTES: usize = 64 * 1024;
+const MAX_CORRECTIONS: usize = 400;
+const MAX_PHRASE: usize = 160;
+
+async fn read_ai_memory(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let Some(user_id) = authed_user_id(&state, &headers) else {
+        return err(StatusCode::UNAUTHORIZED, "invalid_token");
+    };
+    match state.db.get_ai_memory(&user_id) {
+        Ok(Some(row)) => settings_response(StatusCode::OK, &row, None),
+        Ok(None) => err(StatusCode::NOT_FOUND, "not_found"),
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
+}
+
+async fn write_ai_memory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PutSettingsBody>,
+) -> impl IntoResponse {
+    let Some(user_id) = authed_user_id(&state, &headers) else {
+        return err(StatusCode::UNAUTHORIZED, "invalid_token");
+    };
+    if body.revision.is_some_and(|revision| revision < 0) || !ai_memory_ok(&body.document) {
+        return err(StatusCode::BAD_REQUEST, "bad_request");
+    }
+    let Ok(raw) = serde_json::to_string(&body.document) else {
+        return err(StatusCode::BAD_REQUEST, "bad_request");
+    };
+    if raw.len() > MAX_AI_MEMORY_BYTES {
+        return err(StatusCode::BAD_REQUEST, "bad_request");
+    }
+    match state.db.put_ai_memory(&user_id, body.revision, &raw) {
+        Ok(crate::db::SettingsWrite::Saved(row)) => settings_response(StatusCode::OK, &row, None),
+        Ok(crate::db::SettingsWrite::Conflict(row)) => {
+            settings_response(StatusCode::CONFLICT, &row, Some("conflict"))
+        }
+        Ok(crate::db::SettingsWrite::Missing) => err(StatusCode::NOT_FOUND, "not_found"),
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
+}
+
+/// Caption fixes only. Audio, model weights, and secret values stay off this server.
+fn ai_memory_ok(document: &Value) -> bool {
+    let Some(map) = document.as_object() else {
+        return false;
+    };
+    if map.len() != 2 || !map.contains_key("version") || !map.contains_key("corrections") {
+        return false;
+    }
+    if map.get("version").and_then(Value::as_u64) != Some(1) {
+        return false;
+    }
+    let Some(items) = map.get("corrections").and_then(Value::as_array) else {
+        return false;
+    };
+    if items.len() > MAX_CORRECTIONS {
+        return false;
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    let mut heard = std::collections::BTreeSet::new();
+    for item in items {
+        let Some(row) = item.as_object() else {
+            return false;
+        };
+        if row
+            .keys()
+            .any(|key| !matches!(key.as_str(), "id" | "heard" | "says" | "count"))
+        {
+            return false;
+        }
+        if !row.contains_key("id") || !row.contains_key("heard") || !row.contains_key("says") {
+            return false;
+        }
+        let Some(id) = row.get("id").and_then(Value::as_str) else {
+            return false;
+        };
+        if id.is_empty()
+            || id.len() > 64
+            || !id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            return false;
+        }
+        if !ids.insert(id.to_string()) {
+            return false;
+        }
+        let Some(from) = phrase(row.get("heard")) else {
+            return false;
+        };
+        let Some(to) = phrase(row.get("says")) else {
+            return false;
+        };
+        if from.to_lowercase() == to.to_lowercase() || !heard.insert(from.to_lowercase()) {
+            return false;
+        }
+        if let Some(count) = row.get("count") {
+            let Some(number) = count.as_u64() else {
+                return false;
+            };
+            if !(1..=1_000_000).contains(&number) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn phrase(value: Option<&Value>) -> Option<&str> {
+    let text = value?.as_str()?.trim();
+    if text.is_empty() || text.chars().count() > MAX_PHRASE {
+        return None;
+    }
+    if text.chars().any(|ch| ch.is_control()) || text.to_ascii_lowercase().contains("data:") {
+        return None;
+    }
+    Some(text)
+}
+
 const MAX_VAULT_SECRETS: usize = 64;
 const MAX_VAULT_NAME: usize = 128;
 const MAX_VAULT_VALUE: usize = 8 * 1024;
@@ -411,7 +528,13 @@ async fn write_vault(
         return err(StatusCode::BAD_REQUEST, code);
     }
     match state.db.replace_secrets(&user_id, &body.secrets) {
-        Ok(()) => (StatusCode::OK, Json(VaultBody { secrets: body.secrets })).into_response(),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(VaultBody {
+                secrets: body.secrets,
+            }),
+        )
+            .into_response(),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }
 }
@@ -431,7 +554,10 @@ pub fn validate_vault(secrets: &BTreeMap<String, String>) -> Result<(), &'static
     }
     for (name, value) in secrets {
         let trimmed = name.trim();
-        if trimmed.is_empty() || trimmed.len() > MAX_VAULT_NAME || trimmed.chars().any(|ch| ch.is_control()) {
+        if trimmed.is_empty()
+            || trimmed.len() > MAX_VAULT_NAME
+            || trimmed.chars().any(|ch| ch.is_control())
+        {
             return Err("bad_request");
         }
         if is_session_secret(trimmed) {
@@ -543,7 +669,9 @@ fn err(status: StatusCode, code: &str) -> axum::response::Response {
 
 pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let rest = value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer "))?;
+    let rest = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))?;
     Some(rest.trim().to_string())
 }
 
@@ -573,6 +701,76 @@ mod tests {
     }
 
     #[test]
+    fn ai_memory_is_caption_text_only() {
+        let ok = serde_json::json!({
+            "version": 1,
+            "corrections": [
+                {"id": "c1", "heard": "engine twelve", "says": "Engine 12", "count": 2}
+            ]
+        });
+        assert!(ai_memory_ok(&ok));
+        assert!(ai_memory_ok(
+            &serde_json::json!({"version": 1, "corrections": []})
+        ));
+        assert!(!ai_memory_ok(&serde_json::json!({
+            "version": 1,
+            "corrections": [],
+            "audio": "data:audio/wav;base64,AAAA"
+        })));
+        assert!(!ai_memory_ok(&serde_json::json!({
+            "version": 1,
+            "corrections": [{"id": "c1", "heard": "unit", "says": "data:audio/wav;base64,AAAA"}]
+        })));
+        assert!(!ai_memory_ok(&serde_json::json!({
+            "version": 2,
+            "corrections": []
+        })));
+        assert!(!ai_memory_ok(&serde_json::json!({
+            "version": 1,
+            "corrections": [
+                {"id": "c1", "heard": "unit", "says": "Engine 12"},
+                {"id": "c2", "heard": "Unit", "says": "Medic 1"}
+            ]
+        })));
+    }
+
+    #[tokio::test]
+    async fn shared_server_stores_ai_memory_for_the_signed_in_user() {
+        let shared = spawn_server(crate::config::ServerMode::Shared, false)
+            .await
+            .0;
+        let ada = register(&shared, "ada", "correct-password").await;
+        let other = register(&shared, "bea", "correct-password").await;
+        let missing = http(&shared, "GET", "/ai/memory", Some(&ada), None).await;
+        assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
+
+        let body = r#"{"revision":null,"document":{"version":1,"corrections":[{"id":"c1","heard":"engine twelve","says":"Engine 12","count":1}]}}"#;
+        let saved = http(&shared, "PUT", "/ai/memory", Some(&ada), Some(body)).await;
+        assert!(saved.starts_with("HTTP/1.1 200"), "{saved}");
+        assert!(saved.contains("Engine 12"), "{saved}");
+
+        let again = http(&shared, "GET", "/ai/memory", Some(&ada), None).await;
+        assert!(again.contains("\"revision\":1"), "{again}");
+        let hidden = http(&shared, "GET", "/ai/memory", Some(&other), None).await;
+        assert!(hidden.starts_with("HTTP/1.1 404"), "{hidden}");
+
+        let stale = http(&shared, "PUT", "/ai/memory", Some(&ada), Some(body)).await;
+        assert!(stale.starts_with("HTTP/1.1 409"), "{stale}");
+        assert!(stale.contains("conflict"), "{stale}");
+
+        let audio = r#"{"revision":1,"document":{"version":1,"corrections":[],"clip":"data:audio/wav;base64,AAAA"}}"#;
+        let rejected = http(&shared, "PUT", "/ai/memory", Some(&ada), Some(audio)).await;
+        assert!(rejected.starts_with("HTTP/1.1 400"), "{rejected}");
+
+        let device = spawn_server(crate::config::ServerMode::Device, true)
+            .await
+            .0;
+        let local = register(&device, "ada", "correct-password").await;
+        let on_device = http(&device, "PUT", "/ai/memory", Some(&local), Some(body)).await;
+        assert!(on_device.starts_with("HTTP/1.1 200"), "{on_device}");
+    }
+
+    #[test]
     fn vault_rejects_session_tokens() {
         let mut secrets = BTreeMap::new();
         secrets.insert("broadcastify.password".into(), "desk".into());
@@ -583,8 +781,12 @@ mod tests {
 
     #[tokio::test]
     async fn device_server_stores_secrets_and_shared_server_does_not() {
-        let device = spawn_server(crate::config::ServerMode::Device, true).await.0;
-        let shared = spawn_server(crate::config::ServerMode::Shared, false).await.0;
+        let device = spawn_server(crate::config::ServerMode::Device, true)
+            .await
+            .0;
+        let shared = spawn_server(crate::config::ServerMode::Shared, false)
+            .await
+            .0;
 
         let device_health = http(&device, "GET", "/health", None, None).await;
         assert!(device_health.contains("\"mode\":\"device\""));
@@ -596,7 +798,9 @@ mod tests {
             "PUT",
             "/vault",
             Some(&token),
-            Some(r#"{"secrets":{"broadcastify.password":"feed-secret","socrata.app_token":"tok"}}"#),
+            Some(
+                r#"{"secrets":{"broadcastify.password":"feed-secret","socrata.app_token":"tok"}}"#,
+            ),
         )
         .await;
         assert!(put.starts_with("HTTP/1.1 200"), "{put}");
@@ -620,7 +824,8 @@ mod tests {
     async fn admin_account_is_not_a_board_login() {
         let (addr, db_path) = spawn_server(crate::config::ServerMode::Device, false).await;
         let db = crate::db::Db::open(&db_path).unwrap();
-        db.set_server_admin("desk-admin", "server-admin-pass").unwrap();
+        db.set_server_admin("desk-admin", "server-admin-pass")
+            .unwrap();
 
         let board = register(&addr, "desk-admin", "board-password-1").await;
         let me = http(&addr, "GET", "/auth/me", Some(&board), None).await;
@@ -651,9 +856,15 @@ mod tests {
         let admin_token = value["accessToken"].as_str().unwrap();
 
         let admin_as_board = http(&addr, "GET", "/auth/me", Some(admin_token), None).await;
-        assert!(admin_as_board.starts_with("HTTP/1.1 401"), "{admin_as_board}");
+        assert!(
+            admin_as_board.starts_with("HTTP/1.1 401"),
+            "{admin_as_board}"
+        );
         let board_as_admin = http(&addr, "GET", "/admin/api/users", Some(&board), None).await;
-        assert!(board_as_admin.starts_with("HTTP/1.1 401"), "{board_as_admin}");
+        assert!(
+            board_as_admin.starts_with("HTTP/1.1 401"),
+            "{board_as_admin}"
+        );
 
         let users = http(&addr, "GET", "/admin/api/users", Some(admin_token), None).await;
         assert!(users.contains("desk-admin"), "{users}");
@@ -667,11 +878,8 @@ mod tests {
     ) -> (std::net::SocketAddr, std::path::PathBuf) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let dir = std::env::temp_dir().join(format!(
-            "auth-http-{}-{}",
-            std::process::id(),
-            addr.port()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("auth-http-{}-{}", std::process::id(), addr.port()));
         let _ = std::fs::create_dir_all(&dir);
         let cfg = crate::config::Config {
             bind: "127.0.0.1:0".into(),
@@ -748,8 +956,11 @@ mod tests {
             stream.write_all(body.as_bytes()).await.unwrap();
         }
         let mut buf = Vec::new();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_to_end(&mut buf))
-            .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut buf),
+        )
+        .await;
         String::from_utf8_lossy(&buf).to_string()
     }
 }
